@@ -357,6 +357,7 @@ cc_test(
         "//xls/ir:bits_ops",
         "//xls/ir:function_builder",
         "//xls/ir:ir_test_base",
+        "//xls/ir:type",
         "//xls/ir:value",
         "@abseil-cpp//absl/log:check",
         "@abseil-cpp//absl/status",

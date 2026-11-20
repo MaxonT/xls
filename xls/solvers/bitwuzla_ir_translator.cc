@@ -111,6 +111,25 @@ class XlsTerminator : public ::bitwuzla::Terminator {
   std::optional<int64_t> calls_ = 0;
 };
 
+// Flatten zero-width, small, and multidimensional arrays to bit-vectors when
+// their flat bit width is bounded so Bitwuzla's QF_BV engine solves them
+// directly instead of looping inside nested ArraySolver congruence lemmas.
+bool ShouldFlattenArrayType(const ArrayType* type) {
+  const int64_t fbc = type->GetFlatBitCount();
+  return fbc == 0 || (fbc <= 4096 &&
+                      (type->element_type()->IsArray() || type->size() <= 64));
+}
+
+Term MakeConjunction(TermManager& tm, absl::Span<const Term> terms) {
+  if (terms.empty()) {
+    return tm.mk_true();
+  }
+  if (terms.size() == 1) {
+    return terms[0];
+  }
+  return tm.mk_term(Kind::AND, std::vector<Term>(terms.begin(), terms.end()));
+}
+
 }  // namespace
 
 IrTranslator::IrTranslator(std::unique_ptr<TermManager> owned_tm,
@@ -212,6 +231,10 @@ Sort IrTranslator::TypeToSort(const Type* type) {
     }
     case TypeKind::kArray: {
       const ArrayType* at = type->AsArrayOrDie();
+      if (ShouldFlattenArrayType(at)) {
+        int64_t fbc = at->GetFlatBitCount();
+        return tm_.mk_bv_sort(fbc == 0 ? 1 : fbc);
+      }
       return tm_.mk_array_sort(GetArrayIndexSort(at),
                                TypeToSort(at->element_type()));
     }
@@ -235,16 +258,23 @@ Term IrTranslator::GetAsFormattedArrayIndex(Term index, const ArrayType* type,
   Sort sort = GetArrayIndexSort(type);
   uint64_t target_width = sort.bv_size();
   uint64_t actual_width = index.sort().bv_size();
+  const uint64_t max_idx_val =
+      type->empty() ? 0 : static_cast<uint64_t>(type->size() - 1);
+  Term max_idx = GetAsFormattedArrayIndex(max_idx_val, type);
+  Term is_oob;
   Term formatted = index;
   if (actual_width < target_width) {
     formatted = tm_.mk_term(Kind::BV_ZERO_EXTEND, {index},
                             {target_width - actual_width});
-  } else if (actual_width > target_width) {
-    formatted = tm_.mk_term(Kind::BV_EXTRACT, {index}, {target_width - 1, 0});
+    is_oob = tm_.mk_term(Kind::BV_UGT, {formatted, max_idx});
+  } else {
+    // Check OOB at full width before extracting low `target_width` bits.
+    Term wide_max = tm_.mk_bv_value_uint64(index.sort(), max_idx_val);
+    is_oob = tm_.mk_term(Kind::BV_UGT, {index, wide_max});
+    if (actual_width > target_width) {
+      formatted = tm_.mk_term(Kind::BV_EXTRACT, {index}, {target_width - 1, 0});
+    }
   }
-  Term max_idx =
-      GetAsFormattedArrayIndex(type->empty() ? 0 : type->size() - 1, type);
-  Term is_oob = tm_.mk_term(Kind::BV_UGT, {formatted, max_idx});
   if (oob != nullptr) {
     *oob = is_oob;
   }
@@ -303,31 +333,60 @@ absl::StatusOr<Term> IrTranslator::TranslateLiteralValue(const Type* type,
     }
     case TypeKind::kArray: {
       const ArrayType* at = type->AsArrayOrDie();
-      Sort asort = TypeToSort(at);
-      Sort esort = TypeToSort(at->element_type());
-      Term def_val = ZeroOfSort(esort);
-      Term arr = tm_.mk_const_array(asort, def_val);
+      if (at->GetFlatBitCount() == 0) {
+        return MakeZeroTerm(at);
+      }
+      std::vector<Term> elems;
+      elems.reserve(at->size());
       for (int64_t i = 0; i < at->size(); ++i) {
-        Term idx = GetAsFormattedArrayIndex(i, at);
         XLS_ASSIGN_OR_RETURN(
             Term elem,
             TranslateLiteralValue(at->element_type(), val.elements()[i]));
-        arr = tm_.mk_term(Kind::ARRAY_STORE, {arr, idx, elem});
+        elems.push_back(elem);
       }
-      return arr;
+      return BuildArrayFromElements(at, elems, "lit_arr");
     }
   }
   return absl::InvalidArgumentError("Unknown literal type");
 }
 
 Term IrTranslator::ZeroOfSort(const Sort& sort) {
-  if (sort.is_bv()) {
-    return tm_.mk_bv_value_uint64(sort, 0);
+  CHECK(sort.is_bv()) << "ZeroOfSort only supports bit-vector sorts";
+  return tm_.mk_bv_value_uint64(sort, 0);
+}
+
+Term IrTranslator::MakeZeroTerm(const Type* type) {
+  if (!type->IsArray() || !TypeToSort(type).is_array()) {
+    return ZeroOfSort(TypeToSort(type));
   }
-  if (sort.is_array()) {
-    return tm_.mk_const_array(sort, ZeroOfSort(sort.array_element()));
+  const ArrayType* at = type->AsArrayOrDie();
+  std::vector<Term> elems(at->size(), MakeZeroTerm(at->element_type()));
+  return BuildArrayFromElements(at, elems, "zero_arr");
+}
+
+Term IrTranslator::BuildArrayFromElements(const ArrayType* type,
+                                          absl::Span<const Term> elements,
+                                          std::string_view symbol_prefix) {
+  if (type->GetFlatBitCount() == 0) {
+    return MakeZeroTerm(type);
   }
-  LOG(FATAL) << "Unsupported sort for zero";
+  Sort asort = TypeToSort(type);
+  if (!asort.is_array()) {
+    std::vector<Term> flat_elems;
+    flat_elems.reserve(elements.size());
+    for (const Term& elem : elements) {
+      flat_elems.push_back(FlattenToBv(elem, type->element_type()));
+    }
+    return ConcatN(flat_elems);
+  }
+  // Avoid Bitwuzla CONST_ARRAY, which is unsupported under array equalities
+  // and array ITEs; all valid indices [0, size) are stored explicitly.
+  Term arr = tm_.mk_const(asort, GetNewSymbol(symbol_prefix));
+  for (int64_t i = 0; i < elements.size(); ++i) {
+    arr = tm_.mk_term(Kind::ARRAY_STORE,
+                      {arr, GetAsFormattedArrayIndex(i, type), elements[i]});
+  }
+  return arr;
 }
 
 Term IrTranslator::OnesOfSort(const Sort& sort) {
@@ -382,6 +441,9 @@ Term IrTranslator::ConcatN(absl::Span<const Term> args) {
 }
 
 Term IrTranslator::FlattenToBv(Term term, const Type* type) {
+  if (type->GetFlatBitCount() == 0) {
+    return tm_.mk_bv_value_uint64(tm_.mk_bv_sort(1), 0);
+  }
   if (!term.sort().is_array()) {
     return term;
   }
@@ -397,47 +459,59 @@ Term IrTranslator::FlattenToBv(Term term, const Type* type) {
 }
 
 Term IrTranslator::UnflattenFromArrayBv(Term flat_bv, const Type* type) {
-  if (type->kind() != TypeKind::kArray) {
+  if (!TypeToSort(type).is_array()) {
     return flat_bv;
   }
   const ArrayType* at = type->AsArrayOrDie();
-  Sort asort = TypeToSort(at);
-  Sort esort = TypeToSort(at->element_type());
-  Term arr = tm_.mk_const_array(asort, ZeroOfSort(esort));
   int64_t elem_bits = at->element_type()->GetFlatBitCount();
   if (elem_bits == 0) {
-    return arr;
+    return MakeZeroTerm(at);
   }
+  std::vector<Term> elems;
+  elems.reserve(at->size());
   for (int64_t i = 0; i < at->size(); ++i) {
-    Term idx = GetAsFormattedArrayIndex(i, at);
     int64_t low = (at->size() - 1 - i) * elem_bits;
     int64_t high = low + elem_bits - 1;
     Term slice =
         tm_.mk_term(Kind::BV_EXTRACT, {flat_bv},
                     {static_cast<uint64_t>(high), static_cast<uint64_t>(low)});
-    Term elem = UnflattenFromArrayBv(slice, at->element_type());
-    arr = tm_.mk_term(Kind::ARRAY_STORE, {arr, idx, elem});
+    elems.push_back(UnflattenFromArrayBv(slice, at->element_type()));
   }
-  return arr;
+  return BuildArrayFromElements(at, elems, "unflatten_arr");
 }
 
 Term IrTranslator::GetArrayElement(const ArrayType* type, Term array,
                                    Term index) {
+  if (type->empty() || type->element_type()->GetFlatBitCount() == 0) {
+    return MakeZeroTerm(type->element_type());
+  }
   Term idx_formatted = GetAsFormattedArrayIndex(index, type);
   if (array.sort().is_array()) {
     return tm_.mk_term(Kind::ARRAY_SELECT, {array, idx_formatted});
   }
+  if (type->size() == 1) {
+    return UnflattenFromArrayBv(array, type->element_type());
+  }
   int64_t elem_bits = type->element_type()->GetFlatBitCount();
-  if (elem_bits == 0) {
-    return ZeroOfSort(TypeToSort(type->element_type()));
+  if (type->size() <= 64) {
+    Term res = tm_.mk_term(Kind::BV_EXTRACT, {array},
+                           {static_cast<uint64_t>(elem_bits - 1), 0});
+    for (int64_t i = type->size() - 2; i >= 0; --i) {
+      uint64_t low = static_cast<uint64_t>(type->size() - 1 - i) * elem_bits;
+      uint64_t high = low + elem_bits - 1;
+      Term elem_i = tm_.mk_term(Kind::BV_EXTRACT, {array}, {high, low});
+      Term is_i = tm_.mk_term(
+          Kind::EQUAL, {idx_formatted, GetAsFormattedArrayIndex(i, type)});
+      res = tm_.mk_term(Kind::ITE, {is_i, elem_i, res});
+    }
+    return UnflattenFromArrayBv(res, type->element_type());
   }
   uint64_t total_bits = array.sort().bv_size();
-  Term max_i = tm_.mk_bv_value_uint64(idx_formatted.sort(),
-                                      type->empty() ? 0 : type->size() - 1);
-  Term oob = tm_.mk_term(Kind::BV_UGT, {idx_formatted, max_i});
-  Term safe_idx = tm_.mk_term(Kind::ITE, {oob, max_i, idx_formatted});
-  Term ext_idx = tm_.mk_term(Kind::BV_ZERO_EXTEND, {safe_idx},
-                             {total_bits - safe_idx.sort().bv_size()});
+  Term ext_idx =
+      total_bits > idx_formatted.sort().bv_size()
+          ? tm_.mk_term(Kind::BV_ZERO_EXTEND, {idx_formatted},
+                        {total_bits - idx_formatted.sort().bv_size()})
+          : idx_formatted;
   Term elem_w = tm_.mk_bv_value_uint64(ext_idx.sort(), elem_bits);
   Term shift_amt = tm_.mk_term(
       Kind::BV_MUL,
@@ -454,6 +528,9 @@ Term IrTranslator::GetArrayElement(const ArrayType* type, Term array,
 Term IrTranslator::UpdateArrayElement(const Type* type, Term array, Term value,
                                       Term cond,
                                       absl::Span<const Term> indices) {
+  if (type->GetFlatBitCount() == 0) {
+    return array;
+  }
   if (indices.empty()) {
     return tm_.mk_term(Kind::ITE, {cond, value, array});
   }
@@ -484,16 +561,13 @@ Term IrTranslator::UpdateArrayElement(const Type* type, Term array, Term value,
 }
 
 Term IrTranslator::ComputeNe(Term lhs, Term rhs, const Type* type) {
-  if (lhs.sort().is_array() && rhs.sort().is_array()) {
-    Term dist = tm_.mk_term(Kind::DISTINCT, {lhs, rhs});
-    return tm_.mk_term(Kind::ITE,
-                       {dist, tm_.mk_bv_value_uint64(tm_.mk_bv_sort(1), 1),
-                        tm_.mk_bv_value_uint64(tm_.mk_bv_sort(1), 0)});
+  if (type->GetFlatBitCount() == 0) {
+    return tm_.mk_bv_value_uint64(tm_.mk_bv_sort(1), 0);
   }
   Term flat_l = FlattenToBv(lhs, type);
   Term flat_r = FlattenToBv(rhs, type);
   uint64_t w = flat_l.sort().bv_size();
-  if (w == 0 || (type->IsBits() && type->AsBitsOrDie()->bit_count() == 0)) {
+  if (w == 0) {
     return tm_.mk_bv_value_uint64(tm_.mk_bv_sort(1), 0);
   }
   Term eq = tm_.mk_term(Kind::EQUAL, {flat_l, flat_r});
@@ -544,7 +618,7 @@ absl::StatusOr<Term> IrTranslator::GetLttElement(
   }
   int64_t fb = tt->element_type(k)->GetFlatBitCount();
   if (fb == 0) {
-    return ZeroOfSort(TypeToSort(tt->element_type(k)));
+    return MakeZeroTerm(tt->element_type(k));
   }
   Term slice = tm_.mk_term(
       Kind::BV_EXTRACT, {value},
@@ -676,6 +750,47 @@ absl::StatusOr<Value> IrTranslator::ExtractValue(::bitwuzla::Bitwuzla& bitwuzla,
   return absl::InternalError("Unknown type kind in ExtractValue");
 }
 
+absl::StatusOr<Term> IrTranslator::TernaryTreePredicateToAssertion(
+    TernaryTreeView ternaries, LeafTypeTreeView<Term> leaves) {
+  XLS_RET_CHECK_EQ(leaves.size(), ternaries.size());
+  std::vector<Term> constraints;
+  constraints.reserve(ternaries.size());
+  for (int64_t i = 0; i < ternaries.size(); ++i) {
+    TernarySpan t = ternaries.elements()[i];
+    if (!ternary_ops::AllUnknown(t)) {
+      XLS_ASSIGN_OR_RETURN(Term c,
+                           TernaryToConstraint(leaves.elements()[i], t));
+      constraints.push_back(c);
+    }
+  }
+  return MakeConjunction(tm_, constraints);
+}
+
+absl::StatusOr<Term> IrTranslator::IntervalTreePredicateToAssertion(
+    IntervalSetTreeView intervals, LeafTypeTreeView<Term> leaves) {
+  XLS_RET_CHECK_EQ(leaves.size(), intervals.size());
+  std::vector<Term> constraints;
+  constraints.reserve(intervals.size());
+  for (int64_t i = 0; i < intervals.size(); ++i) {
+    const IntervalSet& range = intervals.elements()[i];
+    if (!range.IsMaximal()) {
+      XLS_ASSIGN_OR_RETURN(
+          Term c, IntervalSetToConstraint(leaves.elements()[i], range));
+      constraints.push_back(c);
+    }
+  }
+  return MakeConjunction(tm_, constraints);
+}
+
+absl::StatusOr<Term> IrTranslator::LeafTreePredicateToAssertion(
+    const Predicate& p, Node* subject) {
+  XLS_ASSIGN_OR_RETURN(LeafTypeTree<Term> leaves, ToLeafTypeTree(subject));
+  if (p.kind() == PredicateKind::kCompatibleWithTernary) {
+    return TernaryTreePredicateToAssertion(p.ternaries(), leaves.AsView());
+  }
+  return IntervalTreePredicateToAssertion(p.intervals(), leaves.AsView());
+}
+
 absl::StatusOr<Term> IrTranslator::PredicateToAssertion(const Predicate& p,
                                                         Node* subject,
                                                         Term val) {
@@ -703,6 +818,10 @@ absl::StatusOr<Term> IrTranslator::PredicateToAssertion(const Predicate& p,
     }
     case PredicateKind::kExclusiveWithNode: {
       Term b = GetTranslation(p.node());
+      if (b.sort().is_array()) {
+        return absl::InvalidArgumentError(
+            "Cannot evaluate exclusive-with predicate directly on array sort");
+      }
       Term z_a = ZeroOfSort(val.sort());
       Term z_b = ZeroOfSort(b.sort());
       Term nz_a = tm_.mk_term(Kind::DISTINCT, {val, z_a});
@@ -717,52 +836,9 @@ absl::StatusOr<Term> IrTranslator::PredicateToAssertion(const Predicate& p,
       Term b = TranslateLiteralBits(p.value());
       return tm_.mk_term(Kind::BV_ULE, {val, b});
     }
-    case PredicateKind::kCompatibleWithTernary: {
-      XLS_ASSIGN_OR_RETURN(LeafTypeTree<Term> leaves, ToLeafTypeTree(subject));
-      std::vector<Term> constraints;
-      constraints.reserve(p.ternaries().size());
-      XLS_RETURN_IF_ERROR(leaf_type_tree::ForEachIndex(
-          p.ternaries().AsView(),
-          [&](Type*, TernarySpan t,
-              absl::Span<const int64_t> idx) -> absl::Status {
-            if (!ternary_ops::AllUnknown(t)) {
-              XLS_ASSIGN_OR_RETURN(Term c,
-                                   TernaryToConstraint(leaves.Get(idx), t));
-              constraints.push_back(c);
-            }
-            return absl::OkStatus();
-          }));
-      if (constraints.empty()) {
-        return tm_.mk_true();
-      }
-      if (constraints.size() == 1) {
-        return constraints[0];
-      }
-      return tm_.mk_term(Kind::AND, constraints);
-    }
-    case PredicateKind::kCompatibleWithIntervalSet: {
-      XLS_ASSIGN_OR_RETURN(LeafTypeTree<Term> leaves, ToLeafTypeTree(subject));
-      std::vector<Term> constraints;
-      constraints.reserve(p.intervals().size());
-      XLS_RETURN_IF_ERROR(leaf_type_tree::ForEachIndex(
-          p.intervals().AsView(),
-          [&](Type*, const IntervalSet& range,
-              absl::Span<const int64_t> idx) -> absl::Status {
-            if (!range.IsMaximal()) {
-              XLS_ASSIGN_OR_RETURN(
-                  Term c, IntervalSetToConstraint(leaves.Get(idx), range));
-              constraints.push_back(c);
-            }
-            return absl::OkStatus();
-          }));
-      if (constraints.empty()) {
-        return tm_.mk_true();
-      }
-      if (constraints.size() == 1) {
-        return constraints[0];
-      }
-      return tm_.mk_term(Kind::AND, constraints);
-    }
+    case PredicateKind::kCompatibleWithTernary:
+    case PredicateKind::kCompatibleWithIntervalSet:
+      return LeafTreePredicateToAssertion(p, subject);
   }
   return absl::UnimplementedError("Unhandled predicate kind");
 }
@@ -801,6 +877,10 @@ absl::Status IrTranslator::HandleLiteral(Literal* literal) {
 
 absl::Status IrTranslator::HandleParam(Param* param) {
   if (translations_.contains(param)) {
+    return absl::OkStatus();
+  }
+  if (param->GetType()->GetFlatBitCount() == 0) {
+    NoteTranslation(param, MakeZeroTerm(param->GetType()));
     return absl::OkStatus();
   }
   Term c = tm_.mk_const(TypeToSort(param->GetType()), param->GetName());
@@ -897,6 +977,10 @@ absl::Status IrTranslator::HandleUMulp(PartialProductOp* mul) {
 
 absl::Status IrTranslator::HandleSDiv(BinOp* div) {
   Term lhs = GetTranslation(div->operand(0));
+  if (div->BitCountOrDie() == 0) {
+    NoteTranslation(div, ZeroOfSort(lhs.sort()));
+    return absl::OkStatus();
+  }
   Term rhs = GetTranslation(div->operand(1));
   uint64_t width = lhs.sort().bv_size();
   Term zero = tm_.mk_bv_value_uint64(rhs.sort(), 0);
@@ -915,6 +999,10 @@ absl::Status IrTranslator::HandleSDiv(BinOp* div) {
 
 absl::Status IrTranslator::HandleUDiv(BinOp* div) {
   Term lhs = GetTranslation(div->operand(0));
+  if (div->BitCountOrDie() == 0) {
+    NoteTranslation(div, ZeroOfSort(lhs.sort()));
+    return absl::OkStatus();
+  }
   Term rhs = GetTranslation(div->operand(1));
   Term zero = tm_.mk_bv_value_uint64(rhs.sort(), 0);
   Term is_zero = tm_.mk_term(Kind::EQUAL, {rhs, zero});
@@ -1362,14 +1450,14 @@ absl::Status IrTranslator::HandleOneHot(OneHot* one_hot) {
 Term IrTranslator::BuildOneHotSel(const Type* type,
                                   absl::Span<const Term> sel_conds,
                                   absl::Span<const Term> cases) {
-  Sort sort = TypeToSort(type);
-  Term zero = ZeroOfSort(sort);
   if (cases.empty() || type->GetFlatBitCount() == 0) {
-    return zero;
+    return MakeZeroTerm(type);
   }
-  if (type->IsArray()) {
+  Sort sort = TypeToSort(type);
+  if (sort.is_array()) {
     const ArrayType* at = type->AsArrayOrDie();
-    Term res = zero;
+    std::vector<Term> elems;
+    elems.reserve(at->size());
     std::vector<Term> elem_cases;
     elem_cases.reserve(cases.size());
     for (int64_t j = 0; j < at->size(); ++j) {
@@ -1378,12 +1466,13 @@ Term IrTranslator::BuildOneHotSel(const Type* type,
       for (const Term& c : cases) {
         elem_cases.push_back(tm_.mk_term(Kind::ARRAY_SELECT, {c, idx}));
       }
-      Term elem_res = BuildOneHotSel(at->element_type(), sel_conds, elem_cases);
-      res = tm_.mk_term(Kind::ARRAY_STORE, {res, idx, elem_res});
+      elems.push_back(
+          BuildOneHotSel(at->element_type(), sel_conds, elem_cases));
     }
-    return res;
+    return BuildArrayFromElements(at, elems, "ohs_arr");
   }
 
+  Term zero = ZeroOfSort(sort);
   std::vector<Term> masked_terms;
   masked_terms.reserve(cases.size());
   for (size_t i = 0; i < cases.size(); ++i) {
@@ -1459,8 +1548,7 @@ absl::Status IrTranslator::HandleTupleIndex(TupleIndex* tuple_index) {
   }
   int64_t fb = tt->element_type(idx)->GetFlatBitCount();
   if (fb == 0) {
-    NoteTranslation(tuple_index,
-                    ZeroOfSort(TypeToSort(tuple_index->GetType())));
+    NoteTranslation(tuple_index, MakeZeroTerm(tuple_index->GetType()));
     return absl::OkStatus();
   }
   Term slice = tm_.mk_term(
@@ -1473,15 +1561,12 @@ absl::Status IrTranslator::HandleTupleIndex(TupleIndex* tuple_index) {
 
 absl::Status IrTranslator::HandleArray(Array* array) {
   const ArrayType* at = array->GetType()->AsArrayOrDie();
-  Sort asort = TypeToSort(at);
-  Sort esort = TypeToSort(at->element_type());
-  Term res = tm_.mk_const_array(asort, ZeroOfSort(esort));
-  for (int64_t i = 0; i < array->operand_count(); ++i) {
-    Term idx = GetAsFormattedArrayIndex(i, at);
-    res = tm_.mk_term(Kind::ARRAY_STORE,
-                      {res, idx, GetTranslation(array->operand(i))});
+  std::vector<Term> elems;
+  elems.reserve(array->operand_count());
+  for (Node* operand : array->operands()) {
+    elems.push_back(GetTranslation(operand));
   }
-  NoteTranslation(array, res);
+  NoteTranslation(array, BuildArrayFromElements(at, elems, "array_init"));
   return absl::OkStatus();
 }
 
@@ -1511,22 +1596,18 @@ absl::Status IrTranslator::HandleArrayUpdate(ArrayUpdate* update) {
 
 absl::Status IrTranslator::HandleArrayConcat(ArrayConcat* array_concat) {
   const ArrayType* res_type = array_concat->GetType()->AsArrayOrDie();
-  Sort asort = TypeToSort(res_type);
-  Sort esort = TypeToSort(res_type->element_type());
-  Term res = tm_.mk_const_array(asort, ZeroOfSort(esort));
-  int64_t cur_idx = 0;
+  std::vector<Term> elems;
+  elems.reserve(res_type->size());
   for (Node* arr : array_concat->operands()) {
     const ArrayType* op_type = arr->GetType()->AsArrayOrDie();
     Term arr_val = GetTranslation(arr);
     for (int64_t i = 0; i < op_type->size(); ++i) {
-      Term elem = GetArrayElement(op_type, arr_val,
-                                  GetAsFormattedArrayIndex(i, op_type));
-      res = tm_.mk_term(
-          Kind::ARRAY_STORE,
-          {res, GetAsFormattedArrayIndex(cur_idx++, res_type), elem});
+      elems.push_back(GetArrayElement(op_type, arr_val,
+                                      GetAsFormattedArrayIndex(i, op_type)));
     }
   }
-  NoteTranslation(array_concat, res);
+  NoteTranslation(array_concat,
+                  BuildArrayFromElements(res_type, elems, "array_concat_init"));
   return absl::OkStatus();
 }
 
@@ -1535,17 +1616,23 @@ absl::Status IrTranslator::HandleArraySlice(ArraySlice* slice) {
   const ArrayType* src_type = slice->array()->GetType()->AsArrayOrDie();
   Term src = GetTranslation(slice->array());
   Term start = GetTranslation(slice->start());
-  Sort asort = TypeToSort(res_type);
-  Sort esort = TypeToSort(res_type->element_type());
-  Term res = tm_.mk_const_array(asort, ZeroOfSort(esort));
+  int64_t min_offset_bits = Bits::MinBitCountUnsigned(res_type->size());
+  int64_t start_width = static_cast<int64_t>(start.sort().bv_size());
+  // Zero-extend `start` to avoid wraparound overflow on `start + i`.
+  int64_t offset_width = 1 + std::max(min_offset_bits, start_width);
+  Sort offset_sort = tm_.mk_bv_sort(offset_width);
+  Term start_ext =
+      tm_.mk_term(Kind::BV_ZERO_EXTEND, {start},
+                  {static_cast<uint64_t>(offset_width - start_width)});
+  std::vector<Term> elems;
+  elems.reserve(res_type->size());
   for (int64_t i = 0; i < res_type->size(); ++i) {
-    Term offset = tm_.mk_bv_value_uint64(start.sort(), i);
-    Term src_idx = tm_.mk_term(Kind::BV_ADD, {start, offset});
-    Term elem = GetArrayElement(src_type, src, src_idx);
-    res = tm_.mk_term(Kind::ARRAY_STORE,
-                      {res, GetAsFormattedArrayIndex(i, res_type), elem});
+    Term offset = tm_.mk_bv_value_uint64(offset_sort, i);
+    Term src_idx = tm_.mk_term(Kind::BV_ADD, {start_ext, offset});
+    elems.push_back(GetArrayElement(src_type, src, src_idx));
   }
-  NoteTranslation(slice, res);
+  NoteTranslation(slice,
+                  BuildArrayFromElements(res_type, elems, "array_slice_init"));
   return absl::OkStatus();
 }
 
@@ -1607,7 +1694,8 @@ absl::Status IrTranslator::HandleGate(Gate* gate) {
   Term zero_1b = tm_.mk_bv_value_uint64(cond.sort(), 0);
   Term is_active = tm_.mk_term(Kind::DISTINCT, {cond, zero_1b});
   NoteTranslation(
-      gate, tm_.mk_term(Kind::ITE, {is_active, data, ZeroOfSort(data.sort())}));
+      gate,
+      tm_.mk_term(Kind::ITE, {is_active, data, MakeZeroTerm(gate->GetType())}));
   return absl::OkStatus();
 }
 

@@ -36,6 +36,7 @@
 #include "xls/ir/ir_test_base.h"
 #include "xls/ir/lsb_or_msb.h"
 #include "xls/ir/package.h"
+#include "xls/ir/type.h"
 #include "xls/ir/value.h"
 #include "xls/solvers/prover_matchers.h"
 #include "xls/solvers/solver.h"
@@ -836,6 +837,130 @@ TEST_F(BitwuzlaIrTranslatorTest, HandlesOneHotSelNestedArrayMultiHot) {
                 IsOkAndHolds(IsProvenTrue()))
         << "element " << k;
   }
+}
+
+TEST_F(BitwuzlaIrTranslatorTest, ZeroBitParamSDivAndUDiv) {
+  auto package = CreatePackage();
+  FunctionBuilder fb("f", package.get());
+  BValue x0 = fb.Param("x0", package->GetBitsType(0));
+  BValue zero0 = fb.Literal(UBits(0, 0));
+  BValue sdiv0 = fb.SDiv(x0, zero0);
+  BValue udiv0 = fb.UDiv(x0, zero0);
+  BValue x_param = fb.Param("xp0", package->GetBitsType(0));
+  BValue sdiv_p = fb.SDiv(x_param, zero0);
+
+  XLS_ASSERT_OK_AND_ASSIGN(
+      Function * f, fb.BuildWithReturnValue(fb.Tuple({sdiv0, udiv0, sdiv_p})));
+  EXPECT_THAT(solver_->TryProve(f, sdiv0.node(), Predicate::EqualToZero(),
+                                SolverLimit()),
+              IsOkAndHolds(IsProvenTrue()));
+  EXPECT_THAT(solver_->TryProve(f, udiv0.node(), Predicate::EqualToZero(),
+                                SolverLimit()),
+              IsOkAndHolds(IsProvenTrue()));
+  EXPECT_THAT(solver_->TryProve(f, sdiv_p.node(), Predicate::EqualToZero(),
+                                SolverLimit()),
+              IsOkAndHolds(IsProvenTrue()));
+  EXPECT_THAT(solver_->TryProve(f, x_param.node(), Predicate::EqualToZero(),
+                                SolverLimit()),
+              IsOkAndHolds(IsProvenTrue()));
+}
+
+TEST_F(BitwuzlaIrTranslatorTest, NonPow2ArrayEqualityAndMultidimUpdate) {
+  auto package = CreatePackage();
+  FunctionBuilder fb("f", package.get());
+  Type* u8 = package->GetBitsType(8);
+  Type* arr3_t = package->GetArrayType(3, u8);
+  BValue a = fb.Param("a", arr3_t);
+  BValue rebuilt_a = fb.Array({fb.ArrayIndex(a, {fb.Literal(UBits(0, 2))}),
+                               fb.ArrayIndex(a, {fb.Literal(UBits(1, 2))}),
+                               fb.ArrayIndex(a, {fb.Literal(UBits(2, 2))})},
+                              u8);
+
+  Type* u32 = package->GetBitsType(32);
+  Type* unit_arr_t = package->GetArrayType(
+      1, package->GetArrayType(2, package->GetArrayType(1, u32)));
+  BValue unit_arr = fb.Param("unit_arr", unit_arr_t);
+  BValue idx = fb.Param("idx", u32);
+  BValue val = fb.Param("val", u32);
+  BValue updated = fb.ArrayUpdate(unit_arr, val, {idx, idx, idx});
+  BValue direct = fb.PrioritySelect(
+      fb.Eq(idx, fb.Literal(UBits(0, 32))),
+      {fb.Array(
+          {fb.ArrayUpdate(fb.ArrayIndex(unit_arr, {fb.Literal(UBits(0, 1))}),
+                          val, {idx, idx})},
+          unit_arr_t->AsArrayOrDie()->element_type())},
+      unit_arr);
+
+  BValue prop = fb.And({fb.Eq(a, rebuilt_a), fb.Eq(updated, direct)});
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.BuildWithReturnValue(prop));
+  EXPECT_THAT(solver_->TryProve(f, prop.node(), Predicate::NotEqualToZero(),
+                                SolverLimit()),
+              IsOkAndHolds(IsProvenTrue()));
+}
+
+TEST_F(BitwuzlaIrTranslatorTest, ArraySliceOobAndPrioritySelectWithArrayNode) {
+  auto package = CreatePackage();
+  FunctionBuilder fb("f", package.get());
+  Type* u4 = package->GetBitsType(4);
+  BValue e0 = fb.Param("e0", u4);
+  BValue e1 = fb.Param("e1", u4);
+  BValue arr2 = fb.Array({e0, e1}, u4);
+  // Start=14 >= arr2.size()=2 -> every element in slice must clamp to e1.
+  BValue oob_slice = fb.ArraySlice(arr2, fb.Literal(UBits(14, 4)), 2);
+
+  BValue outer = fb.Param("outer", package->GetArrayType(1, arr2.GetType()));
+  BValue cond = fb.Param("cond", package->GetBitsType(1));
+  BValue psel =
+      fb.PrioritySelect(cond, {fb.Array({arr2}, arr2.GetType())}, outer);
+  BValue psel_idx =
+      fb.ArrayIndex(psel, {fb.Literal(UBits(0, 1)), fb.Literal(UBits(1, 2))});
+
+  BValue check_slice = fb.Eq(oob_slice, fb.Array({e1, e1}, u4));
+  BValue check_psel =
+      fb.Eq(psel_idx,
+            fb.Select(cond, {fb.ArrayIndex(outer, {fb.Literal(UBits(0, 1)),
+                                                   fb.Literal(UBits(1, 2))}),
+                             e1}));
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.BuildWithReturnValue(check_slice));
+  EXPECT_THAT(solver_->TryProve(f, check_slice.node(),
+                                Predicate::NotEqualToZero(), SolverLimit()),
+              IsOkAndHolds(IsProvenTrue()));
+  EXPECT_THAT(solver_->TryProve(f, check_psel.node(),
+                                Predicate::NotEqualToZero(), SolverLimit()),
+              IsOkAndHolds(IsProvenTrue()));
+}
+
+TEST_F(BitwuzlaIrTranslatorTest, LargeSmtArrayOperations) {
+  auto package = CreatePackage();
+  FunctionBuilder fb("f", package.get());
+  Type* u4 = package->GetBitsType(4);
+  Type* arr_t = package->GetArrayType(65, u4);
+  BValue a = fb.Param("a", arr_t);
+  BValue b = fb.Param("b", arr_t);
+  BValue sel = fb.Param("sel", package->GetBitsType(2));
+  BValue idx = fb.Param("idx", package->GetBitsType(8));
+  BValue val = fb.Param("val", u4);
+
+  BValue ohs = fb.OneHotSelect(sel, {a, b});
+  BValue ohs_idx = fb.ArrayIndex(ohs, {idx});
+  BValue expected_idx =
+      fb.OneHotSelect(sel, {fb.ArrayIndex(a, {idx}), fb.ArrayIndex(b, {idx})});
+
+  BValue gated = fb.Gate(fb.Literal(UBits(0, 1)), a);
+  BValue gated_idx = fb.ArrayIndex(gated, {idx});
+
+  BValue oob_update = fb.ArrayUpdate(a, val, {fb.Literal(UBits(65, 8))});
+  BValue oob_idx = fb.ArrayIndex(oob_update, {fb.Literal(UBits(65, 8))});
+
+  BValue prop = fb.And({
+      fb.Eq(ohs_idx, expected_idx),
+      fb.Eq(gated_idx, fb.Literal(UBits(0, 4))),
+      fb.Eq(oob_idx, fb.ArrayIndex(a, {fb.Literal(UBits(64, 8))})),
+  });
+  XLS_ASSERT_OK_AND_ASSIGN(Function * f, fb.BuildWithReturnValue(prop));
+  EXPECT_THAT(solver_->TryProve(f, prop.node(), Predicate::NotEqualToZero(),
+                                SolverLimit()),
+              IsOkAndHolds(IsProvenTrue()));
 }
 
 // Microbenchmarks comparing Bitwuzla against Z3 on representative IR operations
