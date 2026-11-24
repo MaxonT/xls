@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -226,6 +227,49 @@ absl::StatusOr<TargetLayoutInfo> ResolveTargetLayoutInfo(
       "AotPackageEntrypointsProto requires target_layout or data_layout.");
 }
 
+llvm::DataLayout DataLayoutFromTargetLayoutInfo(const TargetLayoutInfo& info) {
+  CHECK_OK(ValidateTargetLayoutInfo(info));
+  // `llvm::DataLayout` keeps all alignment fields and mutators (such as
+  // `setPrimitiveSpec`) private, so parsing a specification string is its only
+  // public API for constructing a non-default layout.
+  std::string spec =
+      absl::StrFormat("%s-S%d-a:%d:%d", info.is_little_endian ? "e" : "E",
+                      info.stack_alignment * 8, info.struct_abi_alignment * 8,
+                      info.struct_pref_alignment * 8);
+  if (info.token_abi_alignment != info.int_abi_alignments[3] ||
+      info.token_pref_alignment != info.int_pref_alignments[3]) {
+    absl::StrAppendFormat(&spec, "-i1:%d:%d", info.token_abi_alignment * 8,
+                          info.token_pref_alignment * 8);
+  }
+  // `llvm::DataLayout` pre-populates `DefaultIntSpecs` for `i8`, `i16`, `i32`,
+  // and `i64` (`i64:32:64`) and resolves integers wider than `IntSpecs.back()`
+  // using the largest entry, while intermediate widths use the smallest entry
+  // `>= BitWidth`. Emit every power-of-two width from `i8` (`log2_bits == 3`)
+  // through at least `i64` (`log2_bits == 6`) and up to the highest width whose
+  // `(abi, pref)` alignments change so every width in `[3, kMaxLog2Bits]`
+  // resolves identically without emitting redundant tail specifiers.
+  int max_spec_log2_bits = 6;
+  for (int log2_bits = 7; log2_bits <= TargetLayoutInfo::kMaxLog2Bits;
+       ++log2_bits) {
+    if (info.int_abi_alignments[log2_bits] !=
+            info.int_abi_alignments[log2_bits - 1] ||
+        info.int_pref_alignments[log2_bits] !=
+            info.int_pref_alignments[log2_bits - 1]) {
+      max_spec_log2_bits = log2_bits;
+    }
+  }
+  for (int log2_bits = 3; log2_bits <= max_spec_log2_bits; ++log2_bits) {
+    absl::StrAppendFormat(&spec, "-i%d:%d:%d", int{1} << log2_bits,
+                          info.int_abi_alignments[log2_bits] * 8,
+                          info.int_pref_alignments[log2_bits] * 8);
+  }
+  llvm::Expected<llvm::DataLayout> layout = llvm::DataLayout::parse(spec);
+  CHECK(static_cast<bool>(layout))
+      << "Failed to construct llvm::DataLayout from TargetLayoutInfo spec '"
+      << spec << "': " << llvm::toString(layout.takeError());
+  return std::move(*layout);
+}
+
 /* static */ void JitRuntime::MaybeInitCompositeChildMemo(
     const Type* child_type, TypeMetricsMemo* memo) {
   if (!child_type->IsBits() && !child_type->IsToken() && !memo->has_value()) {
@@ -240,23 +284,10 @@ JitRuntime::JitRuntime(TargetLayoutInfo layout_info)
 
 JitRuntime::JitRuntime(const llvm::DataLayout& data_layout,
                        llvm::LLVMContext& context)
-    : layout_info_(TargetLayoutInfo::FromDataLayout(data_layout, context)),
-      data_layout_(data_layout) {
-  CHECK_OK(ValidateTargetLayoutInfo(layout_info_));
-}
+    : JitRuntime(TargetLayoutInfo::FromDataLayout(data_layout, context)) {}
 
 JitRuntime::JitRuntime(const llvm::DataLayout& data_layout)
-    : layout_info_(TargetLayoutInfo::FromDataLayout(data_layout)),
-      data_layout_(data_layout) {
-  CHECK_OK(ValidateTargetLayoutInfo(layout_info_));
-}
-
-const llvm::DataLayout& JitRuntime::data_layout() const {
-  CHECK(data_layout_.has_value())
-      << "JitRuntime::data_layout() is only available when constructed from "
-         "an llvm::DataLayout.";
-  return *data_layout_;
-}
+    : JitRuntime(TargetLayoutInfo::FromDataLayout(data_layout)) {}
 
 JitRuntime::TypeMetrics JitRuntime::GetBitsTypeMetrics(
     int64_t bit_count) const {
