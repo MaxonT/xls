@@ -36,8 +36,8 @@
 #include "ortools/math_opt/parameters.pb.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/status/status_macros.h"
-#include "xls/passes/optimization_pass.h"
 #include "xls/scheduling/scheduling_options.h"
+#include "xls/tools/common_flags.h"
 #include "xls/tools/scheduling_options_flags.pb.h"
 
 struct ChannelDelayMap {
@@ -118,19 +118,13 @@ std::string AbslUnparseFlag(const ArcThroughputMap& map) {
 }
 
 // LINT.IfChange
-ABSL_FLAG(int64_t, opt_level, xls::kMaxOptLevel, []() -> const std::string& {
-  static const std::string kDescription = absl::StrFormat(
-      "Optimization level. Ranges from 0 to %d.", xls::kMaxOptLevel);
-  return kDescription;
-}());
+// `--opt_level` and `--delay_model` are defined in common_flags.cc.
 ABSL_FLAG(int64_t, clock_period_ps, 0,
           "Target clock period, in picoseconds. See "
           "https://google.github.io/xls/scheduling for details.");
 ABSL_FLAG(int64_t, pipeline_stages, 0,
           "The number of stages in the generated pipeline. See "
           "https://google.github.io/xls/scheduling for details.");
-ABSL_FLAG(std::string, delay_model, "",
-          "Delay model name to use from registry.");
 ABSL_FLAG(xls::SchedulingStrategy, scheduling_strategy,
           xls::SchedulingStrategy::SDC,
           "Scheduler algorithm to use.\n"

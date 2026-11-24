@@ -27,7 +27,6 @@
 #include "absl/flags/flag.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/str_format.h"
 #include "xls/common/file/filesystem.h"
 #include "xls/common/status/ret_check.h"
 #include "xls/common/status/status_macros.h"
@@ -37,13 +36,13 @@
 #include "xls/passes/pass_pipeline.pb.h"
 #include "xls/passes/query_engine_checker.h"
 #include "xls/passes/verifier_checker.h"
+#include "xls/tools/common_flags.h"
 #include "xls/tools/opt_flags.pb.h"
 #include "xls/tools/opt_flags_handler_registry.h"
 
 // LINT.IfChange
-ABSL_FLAG(std::string, top, "", "Top entity to optimize.");
-ABSL_FLAG(std::string, ir_dump_path, "",
-          "Dump all intermediate IR files to the given directory");
+// `--top`, `--ir_dump_path`, `--opt_level`, and `--delay_model` are defined in
+// common_flags.cc.
 ABSL_FLAG(std::vector<std::string>, skip_passes, {},
           "If specified, passes in this comma-separated list of (short) "
           "pass names are skipped.");
@@ -59,11 +58,6 @@ ABSL_FLAG(
     "they have fewer than the given number of cases. This optimization is "
     "skipped for selects with more cases, since it can sometimes reduce output "
     "quality by replacing MUX trees with separate equality checks.");
-ABSL_FLAG(int64_t, opt_level, xls::kMaxOptLevel, []() -> const std::string& {
-  static const std::string kDescription = absl::StrFormat(
-      "Optimization level. Ranges from 0 to %d.", xls::kMaxOptLevel);
-  return kDescription;
-}());
 ABSL_FLAG(std::string, ram_rewrites_pb, "",
           "Path to protobuf describing ram rewrites.");
 ABSL_FLAG(bool, use_context_narrowing_analysis, false,
@@ -91,9 +85,6 @@ ABSL_FLAG(bool, force_resource_sharing, false,
           "sharing pass is enabled.");
 ABSL_FLAG(std::string, area_model, "asap7",
           "Area model to use for optimizations.");
-ABSL_FLAG(
-    std::string, delay_model, "asap7",
-    "Delay model to use for optimizations benefiting from timing information.");
 ABSL_FLAG(
     std::optional<std::string>, passes, std::nullopt,
     "Explicit list of passes to run in a specific order. Passes are named "
@@ -142,7 +133,7 @@ ABSL_FLAG(std::optional<std::string>, opt_options_used_textproto_file,
           std::nullopt,
           "If present, path to write a protobuf recording all opt args "
           "used (including those set on the cmd line).");
-// LINT.ThenChange(//xls/build_rules/xls_ir_rules.bzl)
+// LINT.ThenChange(//xls/build_rules/xls_providers.bzl)
 
 namespace xls {
 namespace {
@@ -202,7 +193,7 @@ absl::StatusOr<bool> SetOptionsFromFlags(OptFlagsProto& proto) {
 
   POPULATE_FLAG(opt_level)
   POPULATE_FLAG(top)
-  POPULATE_FLAG(ir_dump_path)
+  POPULATE_OPTIONAL_FLAG(ir_dump_path)
   // skip_passes is a repeated flag.
   {
     any_flags_set |= FLAGS_skip_passes.IsSpecifiedOnCommandLine();

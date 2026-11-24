@@ -12,17 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "xls/tools/delay_info_flags.h"
+
 #include <optional>
 #include <string>
 #include <string_view>
 
 #include "absl/flags/flag.h"
+#include "xls/tools/common_flags.h"
 #include "xls/tools/delay_info_flags.pb.h"
 
-ABSL_FLAG(
-    std::string, top, "",
-    "The name of the top entity. Currently, only functions are supported. "
-    "Function to emit delay information about.");
+// `--top` is defined in common_flags.cc.
 ABSL_FLAG(std::string, schedule_path, "",
           "Optional path to a pipeline schedule to use for emitting per-stage "
           "critical paths.");
